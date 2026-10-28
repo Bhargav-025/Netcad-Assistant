@@ -1,0 +1,754 @@
+// Background service worker for handling AI API requests
+
+importScripts('shared.js', 'localbrain.js', 'localai.js');
+
+// Gemini model. 'gemini-2.5-flash' shuts down on 2026-10-16, so we target the
+// newest Flash and fall back to Google's auto-updating alias if the ID 404s.
+const GEMINI_MODEL = 'gemini-3.8-flash';
+const GEMINI_FALLBACK_MODEL = 'gemini-flash-latest';
+const GEMINI_MAX_OUTPUT_TOKENS = 8192; // Gemini 3.x "thinks" first; thinking tokens count toward this limit
+
+async function fetchGemini(requestBody, apiKey) {
+  const call = (model) => fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) }
+  );
+  let response = await call(GEMINI_MODEL);
+  if (response.status === 404) {
+    console.warn(`${GEMINI_MODEL} not found, retrying with ${GEMINI_FALLBACK_MODEL}`);
+    response = await call(GEMINI_FALLBACK_MODEL);
+  }
+  return response;
+}
+
+const SYSTEM_PROMPT = `SYSTEM:
+You are an AI assistant that answers multiple-choice questions with extreme precision.
+
+CRITICAL RULES - YOU MUST FOLLOW THESE EXACTLY:
+1. Think carefully before answering; simulate code or calculate math internally
+2. ONLY output the letter(s) specified in the prompt (e.g., A, B, C, D, E, F)
+3. If asked for ONE letter, provide EXACTLY ONE letter
+4. If asked for N letters, provide EXACTLY N letters separated by commas
+5. NEVER include explanations, reasoning, punctuation, or extra text
+6. NEVER output more or fewer letters than requested
+7. Follow the EXACT format specified in the user prompt
+
+Your response must contain ONLY the requested letter(s) and nothing else.
+End.
+`
+
+const MATCHING_SYSTEM_PROMPT =
+  "You are answering a matching question. Follow the exact output format requested in the user's prompt — one 'Row N: <option text>' line per row, nothing else.";
+
+const temperature = 0;
+const top_p = 1.0;
+const max_tokens = 2000; // Increased for Gemini compatibility
+const presence_penalty = 0;
+const frequency_penalty = 0;
+
+const WEB_AI_SITES = {
+  'chatgpt-web': {
+    url: 'https://chatgpt.com/',
+    siteName: 'ChatGPT',
+  },
+  'gemini-web': {
+    url: 'https://gemini.google.com/app',
+    siteName: 'Gemini',
+  },
+};
+
+function waitForTabLoad(tabId, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('Timed out waiting for the Web AI tab to finish loading.'));
+    }, timeoutMs);
+
+    function listener(updatedTabId, changeInfo) {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(listener);
+
+    // Cover the case where the tab is already 'complete' by the time we get here.
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab && tab.status === 'complete') {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }).catch(() => {});
+  });
+}
+
+async function ensureWebAiTab(modelType, windowId) {
+  const config = WEB_AI_SITES[modelType];
+
+  // Look for an already-open tab on the site rather than tracking the tab ID
+  // in a plain in-memory variable: MV3 service workers get evicted after
+  // ~30s of inactivity (routine between quiz questions), which would reset
+  // any in-memory map and silently spawn a fresh tab — and a fresh
+  // conversation — on every single click. Querying live tabs works
+  // correctly regardless of whether the worker was just restarted.
+  const urlPattern = new URL(config.url).origin + '/*';
+  const existingTabs = await chrome.tabs.query({ url: urlPattern });
+  if (existingTabs.length > 0) {
+    return existingTabs[0].id;
+  }
+
+  // Open as a normal tab in the same browser window as the quiz — not a
+  // separate OS-level popup window — so everything stays in one place.
+  // `active: false` keeps focus on the quiz tab so the automation doesn't
+  // yank the user away from what they're doing; they can switch to it at
+  // any time to watch progress.
+  const tab = await chrome.tabs.create({
+    url: config.url,
+    windowId,
+    active: false,
+  });
+
+  await waitForTabLoad(tab.id);
+  return tab.id;
+}
+
+async function chatgptWebAutomationInPage(prompt) {
+  function query(selectors) {
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  // A freshly-opened tab reports "complete" (document load) well before
+  // ChatGPT's SPA finishes hydrating and rendering the actual chat input —
+  // confirmed live: the input reliably exists once the page settles, but
+  // checking immediately raced it and produced a false "not logged in"
+  // error. Poll for it instead of checking once.
+  let input = null;
+  const inputDeadline = Date.now() + 15000;
+  while (Date.now() < inputDeadline) {
+    input = query(['#prompt-textarea', '[contenteditable="true"][id*="prompt"]', 'div[contenteditable="true"]']);
+    if (input) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!input) {
+    return { success: false, error: 'not-logged-in-or-selector-changed' };
+  }
+
+  // Same defensive verify as Gemini's automation below — make sure the full
+  // prompt actually landed in the input before sending, retrying a couple of
+  // times if not (most likely to matter right after the tab was activated).
+  let typedOk = false;
+  for (let attempt = 0; attempt < 3 && !typedOk; attempt++) {
+    input.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('delete', false, null);
+    document.execCommand('insertText', false, prompt);
+    await new Promise((r) => setTimeout(r, 400));
+    const typedText = (input.textContent || '').replace(/\s+/g, ' ').trim();
+    const expectedText = prompt.replace(/\s+/g, ' ').trim();
+    typedOk = typedText.length >= expectedText.length * 0.9;
+  }
+
+  const sendBtn = query(['[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[aria-label="Send"]']);
+  if (sendBtn) {
+    sendBtn.click();
+  } else {
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  }
+  await new Promise((r) => setTimeout(r, 1500));
+
+  const deadline = Date.now() + 45000;
+  let lastText = '';
+  let stableCount = 0;
+
+  while (Date.now() < deadline) {
+    const stopBtn = query(['[data-testid="stop-button"]', 'button[aria-label="Stop generating"]', 'button[aria-label="Stop streaming"]']);
+    const messages = document.querySelectorAll('[data-message-author-role="assistant"]');
+    const fallback1 = document.querySelectorAll('.markdown.prose');
+    const fallback2 = document.querySelectorAll('.agent-turn');
+    const list = messages.length ? messages : (fallback1.length ? fallback1 : fallback2);
+    const currentText = list.length ? list[list.length - 1].textContent.trim() : '';
+
+    if (!stopBtn && currentText && currentText === lastText) {
+      stableCount++;
+      if (stableCount >= 2) {
+        return { success: true, text: currentText };
+      }
+    } else {
+      stableCount = 0;
+    }
+    lastText = currentText;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  return lastText ? { success: true, text: lastText } : { success: false, error: 'timeout-no-response' };
+}
+
+async function geminiWebAutomationInPage(prompt) {
+  function query(selectors) {
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  // Same SPA-hydration race as ChatGPT — poll instead of checking once.
+  let input = null;
+  const inputDeadline = Date.now() + 15000;
+  while (Date.now() < inputDeadline) {
+    input = query(['.ql-editor[contenteditable="true"]', 'rich-textarea [contenteditable="true"]', 'div[contenteditable="true"]']);
+    if (input) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!input) {
+    return { success: false, error: 'not-logged-in-or-selector-changed' };
+  }
+
+  // Confirmed live: on Gemini's rich-text (.ql-editor) input, insertText
+  // occasionally only lands part of a multi-line prompt (observed: just the
+  // "ignore previous questions" prefix went in, and Gemini answered that
+  // alone instead of the real question) — most often when the tab wasn't
+  // focused yet when this ran. Verify the full text actually landed before
+  // sending, retrying a couple of times rather than firing off a
+  // known-incomplete prompt.
+  let typedOk = false;
+  for (let attempt = 0; attempt < 3 && !typedOk; attempt++) {
+    input.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('delete', false, null);
+    document.execCommand('insertText', false, prompt);
+    await new Promise((r) => setTimeout(r, 400));
+    const typedText = (input.textContent || '').replace(/\s+/g, ' ').trim();
+    const expectedText = prompt.replace(/\s+/g, ' ').trim();
+    typedOk = typedText.length >= expectedText.length * 0.9;
+  }
+
+  const sendBtn = query(['button[aria-label="Send message"]']);
+  if (sendBtn && !sendBtn.disabled) {
+    sendBtn.click();
+  } else {
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  }
+  await new Promise((r) => setTimeout(r, 1500));
+
+  const deadline = Date.now() + 45000;
+  let lastText = '';
+  let stableCount = 0;
+
+  while (Date.now() < deadline) {
+    const responses = document.querySelectorAll('.model-response-text, message-content, .markdown.markdown-main-panel');
+    const currentText = responses.length ? responses[responses.length - 1].textContent.trim() : '';
+    const busy = document.querySelector('[aria-busy="true"]');
+
+    if (!busy && currentText && currentText === lastText) {
+      stableCount++;
+      if (stableCount >= 2) {
+        return { success: true, text: currentText };
+      }
+    } else {
+      stableCount = 0;
+    }
+    lastText = currentText;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  return lastText ? { success: true, text: lastText } : { success: false, error: 'timeout-no-response' };
+}
+
+function wrapWebAiPrompt(prompt) {
+  const prefix = "Ignore all previous questions and answers in this conversation. Treat the following as a brand-new, unrelated question.\n\n";
+  return prefix + prompt;
+}
+
+async function askWebAi(modelType, prompt, windowId, originTabId) {
+  const config = WEB_AI_SITES[modelType];
+  const tabId = await ensureWebAiTab(modelType, windowId);
+  const func = modelType === 'chatgpt-web' ? chatgptWebAutomationInPage : geminiWebAutomationInPage;
+
+  // Confirmed live: ChatGPT/Gemini only reliably type into and render
+  // updates to their chat UI while their tab is the active tab in its
+  // window — a background tab defers rendering (streamed replies never
+  // appeared in the DOM) and, for Gemini's rich-text editor specifically,
+  // even truncated what got typed in. Automate the "bring it to the front"
+  // step that previously required the user to manually switch tabs, then
+  // switch back to the quiz tab afterward so their view doesn't stay stuck
+  // on the Web AI tab.
+  await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func,
+      args: [prompt],
+    });
+  } catch (e) {
+    throw new Error(`Lost connection to the ${config.siteName} tab (it may have been closed or navigated away). Please try again.`);
+  } finally {
+    if (originTabId) {
+      await chrome.tabs.update(originTabId, { active: true }).catch(() => {});
+    }
+  }
+
+  const result = results && results[0] ? results[0].result : null;
+
+  if (!result || !result.success) {
+    const reason = result ? result.error : 'unknown-error';
+    if (reason === 'not-logged-in-or-selector-changed') {
+      throw new Error(`Could not find the ${config.siteName} chat input. Please make sure you're logged in to ${config.siteName} in the Web AI window that just opened, then click the button again.`);
+    }
+    if (reason === 'timeout-no-response') {
+      throw new Error(`Timed out waiting for a response from ${config.siteName}. Please try again.`);
+    }
+    throw new Error(`${config.siteName} automation failed: ${reason}`);
+  }
+
+  return result.text;
+}
+
+async function handleRobustClickCdp(tabId, x, y) {
+  const debuggee = { tabId };
+  await chrome.debugger.attach(debuggee, '1.3');
+  try {
+    await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x,
+      y,
+      button: 'left',
+      clickCount: 1,
+    });
+    await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x,
+      y,
+      button: 'left',
+      clickCount: 1,
+    });
+    return { success: true };
+  } finally {
+    await chrome.debugger.detach(debuggee).catch(() => {});
+  }
+}
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'getAnswer') {
+    // Web AI needs to know which browser window/tab the quiz lives in so the
+    // ChatGPT/Gemini tab opens alongside it (instead of in its own window)
+    // and focus can be handed back to the quiz tab once the answer is in.
+    const windowId = sender.tab && sender.tab.windowId;
+    const originTabId = sender.tab && sender.tab.id;
+    if (request.isMatching) {
+      handleGetMatchingAnswer(request.rows, request.modelType, windowId, originTabId)
+        .then(result => sendResponse(result))
+        .catch(error => sendResponse({ success: false, error: error.message }));
+      return true;
+    }
+    handleGetAnswer(
+      request.question,
+      request.options,
+      request.modelType,
+      request.isMultipleAnswer,
+      request.requiredAnswers,
+      windowId,
+      originTabId
+    )
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true; // Keep message channel open for async response
+  }
+  if (request.action === 'localAiStatus' || request.action === 'localAiInit' ||
+      request.action === 'localAiUnload' || request.action === 'localAiDelete') {
+    const fn = { localAiStatus: 'status', localAiInit: 'init', localAiUnload: 'unload', localAiDelete: 'deleteCache' }[request.action];
+    LocalAi[fn]()
+      .then(result => sendResponse({ success: true, ...result }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+  if (request.action === 'robustClickCdp') {
+    handleRobustClickCdp(sender.tab.id, request.x, request.y)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+});
+
+async function handleGetAnswer(question, options, modelType, isMultipleAnswer = false, requiredAnswers = 1, windowId, originTabId) {
+  try {
+    // Get settings from storage
+    const settings = await chrome.storage.sync.get([
+      'geminiApiKey',
+      'openAiApiKey'
+    ]);
+
+    let answerIndex;
+
+    // Local answer bank first (instant, no API call) for the API providers.
+    const useBank = modelType === 'gpt' || modelType === 'gemini';
+    if (useBank) {
+      const hit = await LocalBrain.lookupMcq(question, options, isMultipleAnswer, requiredAnswers);
+      if (hit) return { success: true, answerIndex: hit.answerIndex, source: 'local', score: hit.score };
+    }
+
+    // Local LLM (WebLLM) policy: 'first' = try it before the cloud, 'fallback' = only if the cloud fails.
+    const aiMode = useBank ? await LocalAi.getMode() : 'off';
+    if (aiMode === 'first') {
+      try {
+        const idx = await LocalAi.askMcq(question, options, isMultipleAnswer, requiredAnswers);
+        return { success: true, answerIndex: idx, source: 'local-ai' };
+      } catch (e) {
+        console.warn('Local AI failed, using cloud:', e.message);
+      }
+    }
+
+    try {
+    if (modelType === 'gpt') {
+      const apiKey = settings.openAiApiKey;
+      if (!apiKey) {
+        throw new Error('OpenAI API key not configured. Please set it in the extension popup.');
+      }
+      answerIndex = await getAnswerFromOpenAI(question, options, apiKey, isMultipleAnswer, requiredAnswers);
+    } else if (modelType === 'gemini') {
+      const apiKey = settings.geminiApiKey;
+      if (!apiKey) {
+        throw new Error('Gemini API key not configured. Please set it in the extension popup.');
+      }
+      answerIndex = await getAnswerFromGemini(question, options, apiKey, isMultipleAnswer, requiredAnswers);
+    } else if (modelType === 'chatgpt-web' || modelType === 'gemini-web') {
+      const prompt = wrapWebAiPrompt(buildPrompt(question, options, isMultipleAnswer, requiredAnswers));
+      const rawText = await askWebAi(modelType, prompt, windowId, originTabId);
+      answerIndex = parseAnswerLetters(rawText, options, isMultipleAnswer, requiredAnswers);
+    } else if (modelType === 'local-ai') {
+      answerIndex = await LocalAi.askMcq(question, options, isMultipleAnswer, requiredAnswers);
+    } else {
+      throw new Error('Unknown model type: ' + modelType);
+    }
+    } catch (apiErr) {
+      if (aiMode === 'fallback') {
+        try {
+          const idx = await LocalAi.askMcq(question, options, isMultipleAnswer, requiredAnswers);
+          return { success: true, answerIndex: idx, source: 'local-ai' };
+        } catch (e) {
+          console.warn('Local AI fallback failed:', e.message);
+        }
+      }
+      throw apiErr;
+    }
+
+    if (useBank) await LocalBrain.saveMcq(question, options, answerIndex);
+    return { success: true, answerIndex: answerIndex };
+  } catch (error) {
+    console.error('Error getting answer:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+async function handleGetMatchingAnswer(rows, modelType, windowId, originTabId) {
+  try {
+    const settings = await chrome.storage.sync.get(['geminiApiKey', 'openAiApiKey']);
+    let rowAnswers;
+
+    const useBank = modelType === 'gpt' || modelType === 'gemini';
+    if (useBank) {
+      const hit = await LocalBrain.lookupMatching(rows);
+      if (hit) return { success: true, rowAnswers: hit, source: 'local' };
+    }
+
+    const aiMode = useBank ? await LocalAi.getMode() : 'off';
+    if (aiMode === 'first') {
+      try {
+        return { success: true, rowAnswers: await LocalAi.askMatching(rows), source: 'local-ai' };
+      } catch (e) {
+        console.warn('Local AI failed, using cloud:', e.message);
+      }
+    }
+
+    try {
+    if (modelType === 'gpt') {
+      const apiKey = settings.openAiApiKey;
+      if (!apiKey) {
+        throw new Error('OpenAI API key not configured. Please set it in the extension popup.');
+      }
+      rowAnswers = await getMatchingAnswerFromOpenAI(rows, apiKey);
+    } else if (modelType === 'gemini') {
+      const apiKey = settings.geminiApiKey;
+      if (!apiKey) {
+        throw new Error('Gemini API key not configured. Please set it in the extension popup.');
+      }
+      rowAnswers = await getMatchingAnswerFromGemini(rows, apiKey);
+    } else if (modelType === 'chatgpt-web' || modelType === 'gemini-web') {
+      const rawText = await askWebAi(modelType, wrapWebAiPrompt(buildMatchingPrompt(rows)), windowId, originTabId);
+      rowAnswers = parseMatchingAnswer(rawText, rows);
+    } else if (modelType === 'local-ai') {
+      rowAnswers = await LocalAi.askMatching(rows);
+    } else {
+      throw new Error('Unknown model type: ' + modelType);
+    }
+    } catch (apiErr) {
+      if (aiMode === 'fallback') {
+        try {
+          return { success: true, rowAnswers: await LocalAi.askMatching(rows), source: 'local-ai' };
+        } catch (e) {
+          console.warn('Local AI fallback failed:', e.message);
+        }
+      }
+      throw apiErr;
+    }
+
+    if (useBank) await LocalBrain.saveMatching(rows, rowAnswers);
+    return { success: true, rowAnswers: rowAnswers };
+  } catch (error) {
+    console.error('Error getting matching answer:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+async function getAnswerFromGemini(question, options, apiKey, isMultipleAnswer = false, requiredAnswers = 1) {
+  const prompt = buildPrompt(question, options, isMultipleAnswer, requiredAnswers);
+
+  const requestBody = {
+    contents: [{
+      parts: [{
+        text: prompt
+      }]
+    }],
+    generationConfig: {
+      temperature: temperature,
+      topP: top_p,
+      maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
+    },
+    safetySettings: [
+      {
+        category: "HARM_CATEGORY_HARASSMENT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_HATE_SPEECH",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+        threshold: "BLOCK_NONE"
+      }
+    ]
+  };
+
+  const response = await fetchGemini(requestBody, apiKey);
+
+  const data = await response.json();
+  console.log('Gemini raw response:', data);
+  console.log('Response status:', response.status, response.statusText);
+
+  if (!response.ok) {
+    console.error('Gemini API error response:', data);
+    throw new Error(`Gemini API error: ${data.error?.message || response.statusText}`);
+  }
+
+  console.log('Gemini API response (formatted):', JSON.stringify(data, null, 2));
+
+  // Check if response has the expected structure
+  if (!data || typeof data !== 'object' || !data.candidates || data.candidates.length === 0) {
+    console.error('Unexpected Gemini response structure:', data);
+    console.error('data.candidates:', data.candidates);
+    throw new Error('Gemini returned no candidates or an invalid response structure. Full response: ' + JSON.stringify(data));
+  }
+
+  // Log the candidate structure for debugging
+  console.log('First candidate structure:', JSON.stringify(data.candidates[0], null, 2));
+
+  // Check if content was blocked by safety filters (but MAX_TOKENS is OK if we have content)
+  const candidate = data.candidates[0];
+  const blockingReasons = ['SAFETY', 'RECITATION', 'OTHER'];
+
+  if (candidate.finishReason && blockingReasons.includes(candidate.finishReason)) {
+    console.error('Gemini blocked or filtered the response. Finish reason:', candidate.finishReason);
+    console.error('Safety ratings:', candidate.safetyRatings);
+    throw new Error(`Gemini blocked the response. Reason: ${candidate.finishReason}. This might be due to content filters.`);
+  }
+
+  // Log finish reason for debugging
+  if (candidate.finishReason) {
+    console.log('Gemini finish reason:', candidate.finishReason);
+  }
+
+  const answerText = data.candidates[0]?.content?.parts?.[0]?.text?.trim().toUpperCase();
+
+  if (!answerText) {
+    console.error('Could not extract answer text from candidate:', data.candidates[0]);
+    console.error('Content:', data.candidates[0]?.content);
+    console.error('Parts:', data.candidates[0]?.content?.parts);
+
+    // More detailed error message
+    let errorDetails = 'No answer received from Gemini. ';
+    if (!data.candidates[0]?.content) {
+      errorDetails += 'Response has no content. ';
+    } else if (!data.candidates[0]?.content?.parts) {
+      errorDetails += 'Content has no parts. ';
+    } else if (!data.candidates[0]?.content?.parts?.[0]) {
+      errorDetails += 'Parts array is empty. ';
+    } else if (!data.candidates[0]?.content?.parts?.[0]?.text) {
+      errorDetails += 'First part has no text. ';
+    }
+    errorDetails += 'Full response: ' + JSON.stringify(data.candidates[0]);
+
+    throw new Error(errorDetails);
+  }
+
+  console.log('Gemini answer text:', answerText);
+
+  return parseAnswerLetters(answerText, options, isMultipleAnswer, requiredAnswers);
+}
+
+async function getAnswerFromOpenAI(question, options, apiKey, isMultipleAnswer = false, requiredAnswers = 1) {
+  const url = 'https://api.openai.com/v1/chat/completions';
+
+  const prompt = buildPrompt(question, options, isMultipleAnswer, requiredAnswers);
+
+  const requestBody = {
+    model: 'gpt-4o-mini',
+    messages: [
+      {
+        role: 'system',
+        content: SYSTEM_PROMPT
+      },
+      {
+        role: 'user',
+        content: prompt
+      }
+    ],
+    temperature: temperature,
+    top_p: top_p,
+    max_tokens: max_tokens,
+    presence_penalty: presence_penalty,
+    frequency_penalty: frequency_penalty,
+  };
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  const data = await response.json();
+
+  console.log('OpenAI full response:', JSON.stringify(data, null, 2));
+  console.log('Response status:', response.status, response.statusText);
+
+  if (!response.ok) {
+    console.error('OpenAI API error response:', data);
+    throw new Error(`OpenAI API error: ${data.error?.message || response.statusText}`);
+  }
+
+  const rawContent = data.choices?.[0]?.message?.content;
+  const answerText = rawContent?.trim().toUpperCase();
+
+  if (!answerText) {
+    console.error('Empty or undefined answer text from OpenAI');
+    console.error('Raw content:', rawContent);
+    console.error('Finish reason:', data.choices?.[0]?.finish_reason);
+    console.error('Full response data:', JSON.stringify(data, null, 2));
+
+    let errorDetails = 'No answer received from OpenAI. ';
+    if (!data.choices) {
+      errorDetails += 'Response has no choices array. ';
+    } else if (data.choices.length === 0) {
+      errorDetails += 'Choices array is empty. ';
+    } else if (!data.choices[0].message) {
+      errorDetails += 'First choice has no message. ';
+    } else if (!data.choices[0].message.content) {
+      errorDetails += 'Message has no content. ';
+    } else if (data.choices[0].message.content.trim() === '') {
+      errorDetails += 'Message content is empty/whitespace. ';
+    }
+
+    if (data.choices[0]?.finish_reason === 'length') {
+      errorDetails += 'Response was cut off due to token limit. ';
+    }
+
+    errorDetails += 'Full response: ' + JSON.stringify(data);
+    throw new Error(errorDetails);
+  }
+
+  console.log('OpenAI raw answer:', answerText);
+
+  return parseAnswerLetters(answerText, options, isMultipleAnswer, requiredAnswers);
+}
+
+async function getMatchingAnswerFromOpenAI(rows, apiKey) {
+  const prompt = buildMatchingPrompt(rows);
+  const url = 'https://api.openai.com/v1/chat/completions';
+  const requestBody = {
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: MATCHING_SYSTEM_PROMPT },
+      { role: 'user', content: prompt }
+    ],
+    temperature: temperature,
+    top_p: top_p,
+    max_tokens: max_tokens,
+    presence_penalty: presence_penalty,
+    frequency_penalty: frequency_penalty,
+  };
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`OpenAI API error: ${data.error?.message || response.statusText}`);
+  }
+
+  const answerText = data.choices?.[0]?.message?.content?.trim();
+  if (!answerText) {
+    throw new Error('No answer received from OpenAI for the matching question. Full response: ' + JSON.stringify(data));
+  }
+
+  return parseMatchingAnswer(answerText, rows);
+}
+
+async function getMatchingAnswerFromGemini(rows, apiKey) {
+  const prompt = buildMatchingPrompt(rows);
+  const requestBody = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: temperature,
+      topP: top_p,
+      maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS
+    }
+  };
+
+  const response = await fetchGemini(requestBody, apiKey);
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Gemini API error: ${data.error?.message || response.statusText}`);
+  }
+
+  const answerText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  if (!answerText) {
+    throw new Error('No answer received from Gemini for the matching question. Full response: ' + JSON.stringify(data));
+  }
+
+  return parseMatchingAnswer(answerText, rows);
+}
+

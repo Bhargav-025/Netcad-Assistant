@@ -1,0 +1,219 @@
+/* Helper button styling - Base.
+   Compact circular icon buttons (not wide text pills) so the floating
+   toolbar doesn't cover page content. Each button's label lives in its
+   `title` attribute (native browser tooltip on hover) instead of on-button
+   text. */
+.ai-helper-button {
+  position: fixed;
+  right: 20px;
+  z-index: 10000;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+  font-size: 18px; /* sizes the plain-emoji loading/success states */
+  line-height: 1;
+}
+
+/* GPT Button (Blue) */
+.ai-helper-button-gpt {
+  top: 80px;
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+}
+
+.ai-helper-button-gpt:hover {
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 6px 16px rgba(59, 130, 246, 0.6);
+  background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+}
+
+/* Gemini Button (Purple) */
+.ai-helper-button-gemini {
+  top: 132px;
+  background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
+}
+
+.ai-helper-button-gemini:hover {
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 6px 16px rgba(139, 92, 246, 0.6);
+  background: linear-gradient(135deg, #a78bfa 0%, #8b5cf6 100%);
+}
+
+/* Local AI Button (Orange) */
+.ai-helper-button-local {
+  top: 184px;
+  background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
+}
+
+.ai-helper-button-local:hover {
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 6px 16px rgba(249, 115, 22, 0.6);
+  background: linear-gradient(135deg, #fb923c 0%, #f97316 100%);
+}
+
+/* Web AI Button (Green) */
+.ai-helper-button-webai {
+  top: 236px;
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+}
+
+.ai-helper-button-webai:hover {
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 6px 16px rgba(16, 185, 129, 0.6);
+  background: linear-gradient(135deg, #34d399 0%, #10b981 100%);
+}
+
+/* Module Walker Button (Amber) */
+.ai-helper-button-walker {
+  top: 288px;
+  background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+}
+
+.ai-helper-button-walker:hover {
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 6px 16px rgba(245, 158, 11, 0.6);
+  background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+}
+
+/* Module Walker Progress Overlay */
+.ai-walker-overlay {
+  position: fixed;
+  left: 20px;
+  bottom: 20px;
+  z-index: 10001;
+  background: #1f2937;
+  color: white;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 13px !important;
+  font-family: Arial, Helvetica, sans-serif !important;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  max-width: 360px;
+}
+
+.ai-walker-overlay-status {
+  flex: 1;
+}
+
+.ai-walker-overlay-stop {
+  background: #ef4444;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  cursor: pointer;
+}
+
+.ai-walker-overlay-stop:hover {
+  background: #dc2626;
+}
+
+.ai-helper-button:active {
+  transform: translateY(0);
+}
+
+.ai-helper-button:disabled {
+  background: linear-gradient(135deg, #9ca3af 0%, #6b7280 100%) !important;
+  cursor: not-allowed;
+  opacity: 0.7;
+  transform: none !important;
+}
+
+/* Correct answer highlight */
+.mcq__item.ai-correct-answer {
+  background-color: rgba(34, 197, 94, 0.15) !important;
+  border: 3px solid #22c55e !important;
+  border-radius: 8px !important;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.1) !important;
+  animation: highlight-pulse 1s ease-in-out;
+  transition: all 0.3s ease !important;
+}
+
+.mcq__item.ai-correct-answer .mcq__item-label {
+  font-weight: 600 !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif !important;
+}
+
+.mcq__item.ai-correct-answer::before {
+  content: "✓ AI Suggested";
+  position: absolute;
+  top: -10px;
+  right: 10px;
+  background: #22c55e;
+  color: white;
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif !important;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.3);
+}
+
+/* Pulse animation for highlight */
+@keyframes highlight-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 15px rgba(34, 197, 94, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.1);
+  }
+}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+  .mcq__item.ai-correct-answer {
+    background-color: rgba(34, 197, 94, 0.2) !important;
+  }
+}
+
+/* Mobile responsiveness */
+@media (max-width: 768px) {
+  .ai-helper-button {
+    right: 10px;
+    width: 40px;
+    height: 40px;
+  }
+
+  .ai-helper-button-gpt {
+    top: 70px;
+  }
+
+  .ai-helper-button-gemini {
+    top: 118px;
+  }
+
+  .ai-helper-button-local {
+    top: 166px;
+  }
+
+  .ai-helper-button-webai {
+    top: 214px;
+  }
+
+  .ai-helper-button-walker {
+    top: 262px;
+  }
+
+  .ai-walker-overlay {
+    left: 10px;
+    bottom: 10px;
+    max-width: calc(100% - 20px);
+  }
+}

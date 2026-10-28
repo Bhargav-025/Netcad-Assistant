@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>netAIcad local AI</title></head>
+<body>
+  <!-- Hidden page that hosts the WebLLM engine (service workers die after ~30s idle,
+       which would unload the model; an offscreen document stays alive). -->
+  <script type="module" src="offscreen.js"></script>
+</body>
+</html>
